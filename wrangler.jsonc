@@ -4,18 +4,6 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "ASHFALL_ROOMS",
-        "class_name": "AshfallRoom"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["AshfallRoom"]
-    }
-  ]
+  "durable_objects": { "bindings": [ { "name": "ASHFALL_ROOMS", "class_name": "AshfallRoom" } ] },
+  "migrations": [ { "tag": "v1", "new_sqlite_classes": [ "AshfallRoom" ] } ]
 }
