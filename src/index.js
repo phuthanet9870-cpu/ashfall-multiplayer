@@ -4,9 +4,10 @@
  * Supports shared presence, GM events, limited PvP/war and server-owned online economy.
  * Original local RPG stats/drops are NOT fully authoritative: public-production beta only.
  */
-import { handleService, respond } from './service.js';
+import { handleService, respond, originalDropKind, createOriginalDrop } from './service.js';
 import { SKILLS } from './skills.js';
 import { settleAuctions, ITEM_LABELS } from './economy.js';
+import { roomPreset,spawnPve,pveMove } from './pve.js';
 
 export default {
   async fetch(request, env) {
@@ -23,7 +24,7 @@ export default {
       return stub.fetch(request);
     }
     if (url.pathname === '/' || url.pathname === '/health') {
-      return Response.json({ ok: true, game: 'Ashfall Online', multiplayer: 'shared-gm-market-auction-two-way-trade-ground-drops-pvp-guildwar-cloudsave-beta-v3', transport: 'WebSocket' }, {
+      return Response.json({ ok: true, game: 'Ashfall Online', multiplayer: 'shared-gm-market-auction-two-way-trade-ground-drops-pvp-guildwar-cloudsave-online-pve-v4', transport: 'WebSocket' }, {
         headers: { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' },
       });
     }
@@ -85,6 +86,8 @@ export class AshfallRoom {
     this.boss = null;
     this.bossContributors = new Set();
     this.sharedMobs = null;
+    this.pveVersion = 0;
+    this.lastPveSave = 0;
     this.lastMobTick = Date.now();
     this.skillTimes = new Map();
     this.gmMonsters = [];
@@ -96,6 +99,8 @@ export class AshfallRoom {
     this.ctx.blockConcurrencyWhile(async () => {
       const stored=await this.ctx.storage.get('gm-monsters-v1');
       this.gmMonsters=Array.isArray(stored)?stored.filter(m=>m&&m.expires>Date.now()&&m.hp>0).slice(0,36):[];
+      const pve=await this.ctx.storage.get('shared-pve-v4');
+      if(pve?.version===4 && Array.isArray(pve.mobs) && pve.mobs.length<=40){this.pveVersion=4;this.sharedMobs=pve.mobs;}
       const storedGround=await this.ctx.storage.get('world-ground-drops-v1');
       this.groundDrops=Array.isArray(storedGround)?storedGround.filter(d=>d.expires>Date.now()).slice(0,60):[];
       const config=await this.ctx.storage.get('mmo-global-settings-v1');
@@ -122,6 +127,7 @@ export class AshfallRoom {
     this.ctx.acceptWebSocket(server);
     const id = crypto.randomUUID();
     const key=new URL(request.url).searchParams.get('room');
+    await this.ensurePve(key);
     server.serializeAttachment({ id, presence: {}, last: 0, room:key });
     this.ctx.waitUntil(this.registerWithGlobal(key).catch(()=>{}));
     const peers = existing.map(ws => {
@@ -130,7 +136,7 @@ export class AshfallRoom {
     }).filter(Boolean);
     server.send(JSON.stringify({ t: 'hello', id, peers }));
     if(this.boss)server.send(JSON.stringify({t:'world-boss',state:this.boss}));
-    if(this.sharedMobs)server.send(JSON.stringify({t:'shared-mobs',mobs:this.sharedMobs}));
+    if(this.sharedMobs)server.send(JSON.stringify({t:'shared-mobs',v:4,mobs:this.sharedMobs}));
     server.send(JSON.stringify({t:'gm-mobs',mobs:this.gmMonsters}));
     server.send(JSON.stringify({t:'gm-settings',settings:this.serverSettings}));
     server.send(JSON.stringify({t:'ground-drops',drops:this.groundDrops}));
@@ -169,14 +175,6 @@ export class AshfallRoom {
     if(!this.boss && Number.isFinite(p.x) && Number.isFinite(p.y)) {
       this.boss={id:crypto.randomUUID(),x:Math.round(p.x+4),y:Math.round(p.y),hp:1800,max:1800,deadUntil:0,level:25};
       this.broadcast({t:'world-boss',state:this.boss});
-    }
-    if(!this.sharedMobs && old.room!=='lobby' && Number.isFinite(p.x) && Number.isFinite(p.y)){
-      this.sharedMobs=[
-        {id:'m1',x:p.x+2,y:p.y-3,hp:260,max:260,body:'slime',deadUntil:0},
-        {id:'m2',x:p.x-3,y:p.y-2,hp:290,max:290,body:'goblin',deadUntil:0},
-        {id:'m3',x:p.x+4,y:p.y+2,hp:340,max:340,body:'skeleton',deadUntil:0}
-      ];
-      this.broadcast({t:'shared-mobs',mobs:this.sharedMobs});
     }
     this.tickSharedMobs();
     this.pruneGroundDrops();
@@ -269,23 +267,7 @@ export class AshfallRoom {
       }
       if(modified){this.publishGmMobs();this.ctx.waitUntil(this.persistGmMobs());}
     }
-    if(damage&&this.sharedMobs){
-      let changed=false;
-      for(const mob of this.sharedMobs){
-        if(mob.hp<=0||Math.hypot(x-mob.x,y-mob.y)>1.6||Math.hypot(p.x-mob.x,p.y-mob.y)>range+1.2)continue;
-        mob.hp=Math.max(0,mob.hp-damage*2);
-        if(!mob.hp){mob.deadUntil=now+65000;
-          if(data.account){
-            const registry=this.env.ASHFALL_ROOMS.get(this.env.ASHFALL_ROOMS.idFromName('account-registry-v2'));
-            const roll=Math.random(),bonus=roll<0.035?'iron_blade':roll<0.07?'arcane_staff':roll<0.095?'swift_ring':roll<0.12?'wildfang_bow':'monster_core';
-            this.ctx.waitUntil(registry.fetch(new Request('https://internal/internal/reward',{method:'POST',body:JSON.stringify({users:[data.account],gold:2,shards:0,item:bonus,itemCount:1})})).catch(()=>{}));
-            this.sendTo(id,{t:'loot-reward',item:bonus,count:1,gold:2});
-          }
-        }
-        changed=true;break;
-      }
-      if(changed)this.broadcast({t:'shared-mobs',mobs:this.sharedMobs});
-    }
+    if(damage&&this.sharedMobs)this.ctx.waitUntil(this.hitPve(ws,q,{x,y,range,damage,now}).catch(()=>{}));
   }
   // Online GM permission MUST come from an unguessable Cloudflare Worker secret.
   // /gmadmin2008 unlocks local UI only, never gives server authority.
@@ -380,24 +362,54 @@ export class AshfallRoom {
     }
     this.match=null;
   }
-  tickSharedMobs() {
-    if(!this.sharedMobs)return;
-    const now=Date.now();if(now-this.lastMobTick<220)return;
-    const dt=Math.min(0.25,(now-this.lastMobTick)/1000);this.lastMobTick=now;
-    let changed=false;
-    for(const m of this.sharedMobs){
-      if(!m.hp){if(now>=m.deadUntil){m.hp=m.max;m.deadUntil=0;changed=true;}continue;}
-      let best=null,dist=Infinity;
-      for(const sock of this.ctx.getWebSockets()){
-        const p=sock.deserializeAttachment()?.presence;
-        if(!p||!Number.isFinite(p.x)||!Number.isFinite(p.y))continue;
-        const d=Math.hypot(m.x-p.x,m.y-p.y);
-        if(d<dist){best=p;dist=d;}
-      }
-      if(best&&dist>1.3&&dist<7){const speed=0.9*dt;m.x+=((best.x-m.x)/dist)*speed;m.y+=((best.y-m.y)/dist)*speed;changed=true;}
-    }
-    if(changed)this.broadcast({t:'shared-mobs',mobs:this.sharedMobs});
+  async ensurePve(key){
+    const preset=roomPreset(key);if(!preset)return;
+    if(this.pveVersion===4&&this.sharedMobs)return;
+    this.sharedMobs=spawnPve(key);this.pveVersion=4;
+    await this.ctx.storage.put('shared-pve-v4',{version:4,mobs:this.sharedMobs});
   }
+  persistPve(){
+    if(!this.sharedMobs||this.pveVersion!==4)return;
+    this.ctx.waitUntil(this.ctx.storage.put('shared-pve-v4',{version:4,mobs:this.sharedMobs}));
+  }
+  async hitPve(ws,q,{x,y,range,damage,now}){
+    const info=ws.deserializeAttachment()||{},p=info.presence||{};
+    if(!info.account||!this.sharedMobs?.length)return; // no server rewards for anonymous sessions
+    const chosen=String(q.mid||'').slice(0,45);
+    const candidates=chosen?this.sharedMobs.filter(m=>m.id===chosen):this.sharedMobs;
+    let hit=null,dist=1.85;
+    for(const mob of candidates){if(mob.hp<=0)continue;
+      const d=Math.hypot(x-mob.x,y-mob.y);
+      if(d<dist&&Math.hypot(p.x-mob.x,p.y-mob.y)<=range+1.2){hit=mob;dist=d;}}
+    if(!hit)return;
+    hit.hp=Math.max(0,hit.hp-Math.max(3,damage*2));
+    if(hit.hp===0){
+      const preset=roomPreset(info.room);hit.deadUntil=preset?.kind==='farm'?now+65000:0;
+      const receipt=crypto.randomUUID();hit.lastRewardReceipt=receipt;
+      const item= preset?.kind==='dungeon'?({armory:'iron_blade',sanctum:'arcane_staff',vault:'monster_core',jewel:'swift_ring'}[preset.dungeon.id]):
+        (hit.grade==='boss'||hit.grade==='world'?'boss_relic':'monster_core');
+      const gold=hit.grade==='boss'||hit.grade==='world'?20:3;
+      const registry=this.env.ASHFALL_ROOMS.get(this.env.ASHFALL_ROOMS.idFromName('account-registry-v2'));
+      const originalKind=originalDropKind(info.room,hit.grade);
+      // Persist the kill BEFORE crediting another Durable Object, to avoid double-awarding
+      // a boss when this room hibernates or restarts during reward delivery.
+      await this.ctx.storage.put('shared-pve-v4',{version:4,mobs:this.sharedMobs});
+      const res=await registry.fetch(new Request('https://internal/internal/reward',{method:'POST',body:JSON.stringify({users:[info.account],gold,shards:0,item,itemCount:1,receipt,originalKind,originalLevel:hit.lv})}));
+      if(res.ok)this.sendTo(info.id,{t:'loot-reward',item,count:1,gold});
+    }
+    this.broadcast({t:'shared-mobs',v:4,mobs:this.sharedMobs});
+    if(hit.hp!==0)this.persistPve();
+  }
+  tickSharedMobs() {
+    if(!this.sharedMobs||this.pveVersion!==4)return;
+    const now=Date.now();if(now-this.lastMobTick<250)return;
+    const present=this.ctx.getWebSockets().map(ws=>(ws.deserializeAttachment()||{}).presence);
+    const changed=pveMove(this.sharedMobs,present,now,this.lastMobTick||now);
+    this.lastMobTick=now;
+    if(changed)this.broadcast({t:'shared-mobs',v:4,mobs:this.sharedMobs});
+    if(changed && now-this.lastPveSave>=6000){this.lastPveSave=now;this.persistPve();}
+  }
+
   teamMessage(ws,q) {
     const id=(ws.deserializeAttachment()||{}).id,mode=String(q.mode||'');
     const max={ '3v3':3,'5v5':5,'15v15':15 }[mode];if(!id||!max)return;
@@ -432,12 +444,18 @@ export class AshfallRoom {
       if(!/^[a-z0-9_]{3,20}$/.test(user))continue;
       const key='acct:'+user;
       await this.ctx.storage.transaction(async st=>{
+        const receipt=typeof b.receipt==='string'&&/^[0-9a-f-]{36}$/.test(b.receipt)?'receipt:'+b.receipt+':'+user:null;
+        if(receipt && await st.get(receipt))return;
         const a=await st.get(key);if(!a)return;
         a.onlineGold+=Math.min(30,Math.max(0,Math.trunc(b.gold)||0));
         a.onlineShards+=Math.min(3,Math.max(0,Math.trunc(b.shards)||0));
         a.onlineItems=a.onlineItems||{};
         if(b.item&&Object.hasOwn(ITEM_LABELS,b.item))a.onlineItems[b.item]=Math.min(1000000,(a.onlineItems[b.item]||0)+Math.min(3,Math.max(0,Math.trunc(b.itemCount)||1)));
-        await st.put(key,a);
+        if(b.originalKind&&['gear','acc','rune','relic','gem','fashion','stone','cons','srune','cur'].includes(b.originalKind)){
+          a.originalItems=a.originalItems||{};
+          if(Object.keys(a.originalItems).length<250){const item=createOriginalDrop(b.originalKind,b.originalLevel,a.save?.cls||'blademaster');a.originalItems[item.uid]=item;}
+        }
+        await st.put(key,a);if(receipt)await st.put(receipt,Date.now());
       });
     }
     return respond({ok:true,count:users.length});

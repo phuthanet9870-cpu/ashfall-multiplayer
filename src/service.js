@@ -1,4 +1,5 @@
 import { ITEM_LABELS, economyAction, internalEconomy } from './economy.js';
+import { mintOriginalItem } from './legacy_generator.js';
 // Cloudflare Durable Object single-shard account service for small playable beta.
 // Online wallet is completely separate from the local game save's gold/items.
 const CORS = {'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Content-Type','Cache-Control':'no-store'};
@@ -52,7 +53,7 @@ export async function handleService(ctx, request) {
     const k='acct:'+name;let a=await storage.get(k);
     if(op==='register'){
       if(a)return fail('Username already exists',409);
-      const salt=crypto.randomUUID();a={user:name,salt,hash:await passhash(password,salt),revision:0,save:null,onlineGold:100,onlineShards:5,onlineItems:{},onlineEquipped:{},created:Date.now()};
+      const salt=crypto.randomUUID();a={user:name,salt,hash:await passhash(password,salt),revision:0,save:null,onlineGold:100,onlineShards:5,onlineItems:{},onlineEquipped:{},originalItems:{},created:Date.now()};
       await storage.put(k,a);
     } else {
       if(!a)return fail('Invalid username or password',401);
@@ -84,6 +85,54 @@ export async function handleService(ctx, request) {
       await t.put(acctKey,a);return a.onlineEquipped;
     });
     return equipped?respond({ok:true,onlineEquipped:equipped}):fail('ยังไม่มีอุปกรณ์ออนไลน์ชิ้นนี้',409);
+  }
+  // These are server-issued ORIGINAL game items, not client-supplied GM/local inventory.
+  if(op==='legacy.list'){
+    const offers=[...(await storage.list({prefix:'original-offer:'})).values()];
+    return respond({ok:true,items:Object.values(acc.originalItems||{}).slice(0,250),onlineGold:acc.onlineGold,
+      offers:offers.filter(o=>o.from===user||o.to===user).sort((a,b)=>b.created-a.created).slice(0,40)});
+  }
+  if(op==='legacy.offer'){
+    const config=await storage.get('mmo-global-config-v1')||{};if(config.trade===false)return fail('GM ปิดเทรดออนไลน์ชั่วคราว',403);
+    const open=[...(await storage.list({prefix:'original-offer:'})).values()].filter(o=>o.from===user&&o.status==='open').length;if(open>=10)return fail('มีข้อเสนอค้าง 10 รายการแล้ว',409);
+    const to=String(b.to||'').toLowerCase().trim(),id=String(b.id||''),askGold=Number(b.askGold);
+    if(!validName(to)||to===user||!safeQty(askGold)||!/^[0-9a-f-]{36}$/.test(id))return fail('ข้อเสนอไอเทมไม่ถูกต้อง');
+    const target=await storage.get('acct:'+to);if(!target)return fail('ผู้รับยังไม่มีบัญชีออนไลน์',404);
+    const offerId=crypto.randomUUID();
+    const result=await storage.transaction(async t=>{
+      const a=await t.get(acctKey);if(!a||!a.originalItems?.[id])return false;
+      const item=a.originalItems[id];delete a.originalItems[id];
+      await t.put(acctKey,a);
+      await t.put('original-offer:'+offerId,{id:offerId,from:user,to,askGold,item,status:'open',created:Date.now()});return true;
+    });
+    return result?respond({ok:true,id:offerId}):fail('ไอเทมนี้ถูกนำออกจากกระเป๋าแล้ว',409);
+  }
+  if(op==='legacy.respond'){
+    const config=await storage.get('mmo-global-config-v1')||{};if(config.trade===false)return fail('GM ปิดเทรดออนไลน์ชั่วคราว',403);
+    const id=String(b.id||''),action=String(b.action||'');
+    if(!/^[0-9a-f-]{36}$/.test(id)||!['accept','decline','cancel'].includes(action))return fail('คำสั่งไม่ถูกต้อง');
+    const result=await storage.transaction(async t=>{
+      const key='original-offer:'+id,offer=await t.get(key);
+      if(!offer||offer.status!=='open')return 'closed';
+      if((action==='cancel'&&offer.from!==user)||(action!=='cancel'&&offer.to!==user))return 'forbidden';
+      if(action==='accept'){
+        const buyer=await t.get('acct:'+offer.to),seller=await t.get('acct:'+offer.from);
+        if(!buyer||!seller||buyer.onlineGold<offer.askGold)return 'balance';
+        buyer.originalItems=buyer.originalItems||{};
+        if(Object.keys(buyer.originalItems).length>=250||buyer.originalItems[offer.item.uid])return 'inventory';
+        buyer.onlineGold-=offer.askGold;seller.onlineGold+=offer.askGold;
+        buyer.originalItems[offer.item.uid]=offer.item;
+        await t.put('acct:'+offer.to,buyer);await t.put('acct:'+offer.from,seller);
+      }else{
+        const seller=await t.get('acct:'+offer.from);
+        if(!seller)return 'closed';seller.originalItems=seller.originalItems||{};
+        if(seller.originalItems[offer.item.uid])return 'inventory';
+        seller.originalItems[offer.item.uid]=offer.item;await t.put('acct:'+offer.from,seller);
+      }
+      offer.status=action;offer.closed=Date.now();await t.put(key,offer);
+      return 'ok';
+    });
+    return result==='ok'?respond({ok:true}):fail({closed:'ข้อเสนอนี้ปิดแล้ว',balance:'ยอดทองออนไลน์ไม่พอ',inventory:'กระเป๋าออนไลน์เต็ม',forbidden:'ไม่มีสิทธิ์ดำเนินการ'}[result]||'ทำรายการไม่สำเร็จ',409);
   }
   if(op==='save.get')return respond({ok:true,user,save:acc.save,revision:acc.revision});
   if(op==='save.put'){
@@ -155,4 +204,15 @@ export async function handleService(ctx, request) {
     return result==='insufficient'?fail('ผู้รับมีเครดิต/ไอเทมออนไลน์ไม่พอสำหรับข้อแลกเปลี่ยน',409):result?respond({ok:true,offer:result}):fail('Trade no longer available',409);
   }
   return fail('Unknown request',404);
+}
+
+export function originalDropKind(room,grade){
+ if(room.includes('-d-armory'))return 'gear';if(room.includes('-d-sanctum'))return Math.random()<.2?'srune':'rune';
+ if(room.includes('-d-vault'))return Math.random()<.35?'stone':Math.random()<.6?'cons':'gem';if(room.includes('-d-jewel'))return grade==='boss'?'relic':'acc';
+ if(grade==='rare')return 'fashion';if(grade==='boss'||grade==='world')return 'relic';
+ const roll=Math.random();return roll<.18?'stone':roll<.27?'cons':roll<.35?'cur':roll<.42?'srune':roll<.70?'gear':'acc';
+}
+export function createOriginalDrop(kind,level,cls){
+ const tier=Math.max(1,Math.min(10,Math.ceil(Number(level||1)/25)));
+ return mintOriginalItem(kind,tier,Math.max(1,Math.min(100,Math.round(level/2))),cls);
 }
